@@ -1,78 +1,77 @@
-# Linux Build Configuration for Travis
-
 language: cpp
-
 os:
-  - linux
-  - osx
-
-# Use Ubuntu 14.04 LTS (Trusty) as the Linux testing environment.
+- linux
+- osx
 sudo: required
 dist: trusty
-
 env:
-  - DXC_BUILD_TYPE=Release
-  - DXC_BUILD_TYPE=Debug
-
+- DXC_BUILD_TYPE=Release
+- DXC_BUILD_TYPE=Debug
 compiler:
-  - clang
-
+- clang
 matrix:
   include:
-    - os: linux
-      compiler: gcc
-      addons:
-        apt:
-          sources: ubuntu-toolchain-r-test
-          packages: ninja-build g++-5
-      env: DXC_BUILD_TYPE=Debug
-    - os: linux
-      compiler: gcc
-      addons:
-        apt:
-          sources: ubuntu-toolchain-r-test
-          packages: ninja-build g++-5
-      env: DXC_BUILD_TYPE=Release
-
+  - os: linux
+    compiler: gcc
+    addons:
+      apt:
+        sources: ubuntu-toolchain-r-test
+        packages: ninja-build g++-5
+    env: DXC_BUILD_TYPE=Debug
+  - os: linux
+    compiler: gcc
+    addons:
+      apt:
+        sources: ubuntu-toolchain-r-test
+        packages: ninja-build g++-5
+    env: DXC_BUILD_TYPE=Release
 cache:
   apt: true
-
 git:
   depth: false
-
 branches:
   only:
-    - master
-
+  - master
 addons:
   apt:
     sources: ubuntu-toolchain-r-test
     packages: ninja-build libstdc++-5-dev
-
 before_install:
-  - if [[ "$TRAVIS_OS_NAME" == "osx" ]]; then
-      wget -q https://github.com/ninja-build/ninja/releases/download/v1.7.2/ninja-mac.zip;
-      unzip -q ninja-mac.zip;
-      chmod +x ninja;
-      export PATH="$PWD:$PATH";
-      fi
-
+- if [[ "$TRAVIS_OS_NAME" == "osx" ]]; then wget -q https://github.com/ninja-build/ninja/releases/download/v1.7.2/ninja-mac.zip;
+  unzip -q ninja-mac.zip; chmod +x ninja; export PATH="$PWD:$PATH"; fi
 before_script:
-  - git submodule update --init
-  - if [ ${CC} = gcc ]; then CC=gcc-5; CXX=g++-5; fi
-  - if [[ "$TRAVIS_OS_NAME" == "osx" ]]; then ulimit -Sn 1024; fi
-
+- git submodule update --init
+- if [ ${CC} = gcc ]; then CC=gcc-5; CXX=g++-5; fi
+- if [[ "$TRAVIS_OS_NAME" == "osx" ]]; then ulimit -Sn 1024; fi
 script:
-  - mkdir build && cd build
-  - cmake .. -GNinja
-      $(cat ../utils/cmake-predefined-config-params)
-      -DSPIRV_BUILD_TESTS=ON
-      -DCMAKE_BUILD_TYPE=${DXC_BUILD_TYPE}
-      -DCMAKE_C_COMPILER=${CC} -DCMAKE_CXX_COMPILER=${CXX}
-  - ninja
-  - ./bin/dxc --help
-  - ./bin/dxc -T ps_6_0 ../tools/clang/test/CodeGenSPIRV/passthru-ps.hlsl2spv
-  - ./bin/dxc -T ps_6_0 -Fo passthru-ps.dxil ../tools/clang/test/CodeGenSPIRV/passthru-ps.hlsl2spv
-  - ./bin/dxc -T ps_6_0 -Fo passthru-ps.spv ../tools/clang/test/CodeGenSPIRV/passthru-ps.hlsl2spv -spirv
-  - ./bin/clang-spirv-tests --spirv-test-root ../tools/clang/test/CodeGenSPIRV/
-  - ./bin/clang-hlsl-tests --HlslDataDir $PWD/../tools/clang/test/HLSL/
+- mkdir build && cd build
+- cmake .. -GNinja $(cat ../utils/cmake-predefined-config-params) -DSPIRV_BUILD_TESTS=ON
+  -DCMAKE_BUILD_TYPE=${DXC_BUILD_TYPE} -DCMAKE_C_COMPILER=${CC} -DCMAKE_CXX_COMPILER=${CXX}
+- ninja
+- "./bin/dxc --help"
+- "./bin/dxc -T ps_6_0 ../tools/clang/test/CodeGenSPIRV/passthru-ps.hlsl2spv"
+- "./bin/dxc -T ps_6_0 -Fo passthru-ps.dxil ../tools/clang/test/CodeGenSPIRV/passthru-ps.hlsl2spv"
+- "./bin/dxc -T ps_6_0 -Fo passthru-ps.spv ../tools/clang/test/CodeGenSPIRV/passthru-ps.hlsl2spv
+  -spirv"
+- "./bin/clang-spirv-tests --spirv-test-root ../tools/clang/test/CodeGenSPIRV/"
+- "./bin/clang-hlsl-tests --HlslDataDir $PWD/../tools/clang/test/HLSL/"
+before_deploy:
+  - mkdir s3upload
+  - |
+    if [[ $DXC_BUILD_TYPE == "Release" && $TRAVIS_OS_NAME == "linux" ]]; then
+        cp lib/libdxcompiler.so s3upload/linux-libdxcompiler.so
+    elif [[ $DXC_BUILD_TYPE == "Release" && $TRAVIS_OS_NAME == "osx" ]]; then
+        cp lib/libdxcompiler.dylib s3upload/macos-libdxcompiler.dylib
+    fi
+deploy:
+  local_dir: s3upload
+  provider: s3
+  access_key_id: AKIAZQUG2EQHU4JJWZ3E
+  secret_access_key:
+    secure: BTpd8ZtpdB8j2LghjG5rrgS+RT9iy+flxItQ+BbsvllfLIYL+SqQQ+a9vhlfwy/fuccecvzTrsOExSC5YiXsZsn7Gzs6R/JrVgpR0YPiJUiMPkxCWQzVKc+jh0PydXzk/jtIBDeK6saoKOF196b9cRi9QQsfqkXjzLzLk0c88FzV5bPGoAsxBegxNnPegHOb+1B7XXz1qD+zwv1MwDW1O5Cyngi2LX7aHArybaJNtAsHvZZfOvbk1SiQaegsiSRDzbyzPDN8IxCP+9pFF+XgeAGkc44Gr81zo+5XJ+AfRGUnujd2z9dy51epYrOF6LQXvDbrLB8cmlnR2ThRLnuGNtYMUFDyvbbkKVrtdlrqrDZ6zGltcnH2+e39098W8QQe6vk6AHMv3V2pCVV5Z19bMdZK+x1kMgX9ZaN0Zb64/eUhabJD6PdPa01VhDt/s+x+wh1YTBdNf/YKnUPz8vH/8mmKP5PpzB9gwdHHINEgXloQxv0Xz1W6g/VIck6Fb0nT8edw7RE4jCqzS26BQrmQh/w2Dq+g8JCZu1/HodUhJHpyr8ehogi6cMGa8J1EuZlhb1bsB4iS2BHS5LbIuP1C1+R/0uKlbAw4WXARtjLv4YWx/MyITguln+XTpcvBEE66X0Afchicide9q/DcZ+bb3MIYwzf0dBnAQ6kGHvE4QBs=
+  bucket: dxc-binaries
+  acl: 'public_read'
+  upload-dir: bin
+  skip_cleanup: true
+  on:
+    repo: nicebyte/DirectXShaderCompiler
