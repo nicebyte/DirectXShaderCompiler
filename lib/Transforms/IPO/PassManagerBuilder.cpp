@@ -259,6 +259,9 @@ static void addHLSLPasses(bool HLSLHighLevel, unsigned OptLevel, hlsl::HLSLExten
   // Special Mem2Reg pass that skips precise marker.
   MPM.add(createDxilConditionalMem2RegPass(NoOpt));
 
+  // Remove unneeded dxbreak conditionals
+  MPM.add(createCleanupDxBreakPass());
+
   if (!NoOpt) {
     MPM.add(createDxilConvergentMarkPass());
   }
@@ -325,9 +328,11 @@ void PassManagerBuilder::populateModulePassManager(
     }
 
     if (!HLSLHighLevel)
-      MPM.add(createDxilInsertPreservesPass()); // HLSL Change - insert preserve instructions
+      MPM.add(createDxilInsertPreservesPass(HLSLAllowPreserveValues)); // HLSL Change - insert preserve instructions
 
     if (Inliner) {
+      MPM.add(createHLLegalizeParameter()); // HLSL Change - legalize parameters
+                                            // before inline.
       MPM.add(Inliner);
       Inliner = nullptr;
     }
@@ -372,6 +377,8 @@ void PassManagerBuilder::populateModulePassManager(
   }
 
   // HLSL Change Begins
+
+  MPM.add(createHLLegalizeParameter()); // legalize parameters before inline.
   MPM.add(createAlwaysInlinerPass(/*InsertLifeTime*/false));
   if (Inliner) {
     delete Inliner;

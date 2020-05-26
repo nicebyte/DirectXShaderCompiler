@@ -409,6 +409,7 @@ class db_dxil(object):
         for i in "WriteSamplerFeedback,WriteSamplerFeedbackBias".split(","):
             self.name_idx[i].category = "Sampler Feedback"
             self.name_idx[i].is_feedback = True
+            self.name_idx[i].is_gradient = True
             self.name_idx[i].shader_model = 6,5
             self.name_idx[i].shader_stages = ("library", "pixel",)
         for i in "WriteSamplerFeedbackLevel,WriteSamplerFeedbackGrad".split(","):
@@ -1749,11 +1750,11 @@ class db_dxil(object):
 
         # End of DXIL 1.6 opcodes.
         self.set_op_count_for_version(1, 6, next_op_idx)
-        assert next_op_idx == 218, "next operation index is %d rather than 165 and thus opcodes are broken" % next_op_idx
+        assert next_op_idx == 218, "218 is expected next operation index but encountered %d and thus opcodes are broken" % next_op_idx
 
         # Set interesting properties.
         self.build_indices()
-        for i in "CalculateLOD,DerivCoarseX,DerivCoarseY,DerivFineX,DerivFineY,Sample,SampleBias,SampleCmp,TextureGather,TextureGatherCmp".split(","):
+        for i in "CalculateLOD,DerivCoarseX,DerivCoarseY,DerivFineX,DerivFineY,Sample,SampleBias,SampleCmp".split(","):
             self.name_idx[i].is_gradient = True
         for i in "DerivCoarseX,DerivCoarseY,DerivFineX,DerivFineY".split(","):
             assert self.name_idx[i].is_gradient == True, "all derivatives are marked as requiring gradients"
@@ -1964,6 +1965,7 @@ class db_dxil(object):
 
         add_pass('hlsl-hlemit', 'HLEmitMetadata', 'HLSL High-Level Metadata Emit.', [])
         add_pass("hl-expand-store-intrinsics", "HLExpandStoreIntrinsics", "Expand HLSL store intrinsics", [])
+        add_pass("hl-legalize-parameter", "HLLegalizeParameter", "Legalize parameter", [])
         add_pass('scalarrepl-param-hlsl', 'SROA_Parameter_HLSL', 'Scalar Replacement of Aggregates HLSL (parameters)', [])
         add_pass('scalarreplhlsl', 'SROA_DT_HLSL', 'Scalar Replacement of Aggregates HLSL (DT)', [])
         add_pass('scalarreplhlsl-ssa', 'SROA_SSAUp_HLSL', 'Scalar Replacement of Aggregates HLSL (SSAUp)', [])
@@ -2013,9 +2015,12 @@ class db_dxil(object):
         add_pass('hlsl-validate-wave-sensitivity', 'DxilValidateWaveSensitivity', 'HLSL DXIL wave sensitiveity validation', [])
         add_pass('dxil-elim-vector', 'DxilEliminateVector', 'Dxil Eliminate Vectors', [])
         add_pass('dxil-finalize-preserves', 'DxilFinalizePreserves', 'Dxil Finalize Preserves', [])
-        add_pass('dxil-insert-preserves', 'DxilInsertPreserves', 'Dxil Insert Noops', [])
-        add_pass('dxil-preserve-to-select', 'DxilPreserveToSelect', 'Dxil Insert Noops', [])
+        add_pass('dxil-insert-preserves', 'DxilInsertPreserves', 'Dxil Insert Noops', [
+                {'n':'AllowPreserves', 't':'bool', 'c':1},
+            ])
+        add_pass('dxil-preserves-to-select', 'DxilPreserveToSelect', 'Dxil Preserves To Select', [])
         add_pass('dxil-value-cache', 'DxilValueCache', 'Dxil Value Cache',[])
+        add_pass('hlsl-cleanup-dxbreak', 'CleanupDxBreak', 'HLSL Remove unnecessary dx.break conditions', [])
 
         category_lib="llvm"
         add_pass('ipsccp', 'IPSCCP', 'Interprocedural Sparse Conditional Constant Propagation', [])
@@ -2264,7 +2269,7 @@ class db_dxil(object):
             ViewID,NotInSig _61,NA,NotInSig _61,NotInSig _61,NA,NA,NA,NotInSig _61,NA,NA,NA,NotInSig _61,NA,NotInSig _61,NA,NA,NotInSig,NA,NA,NA
             Barycentrics,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NotPacked _61,NA,NA,NA,NA,NA,NA
             ShadingRate,NA,SV _64,NA,NA,SV _64,SV _64,NA,NA,SV _64,SV _64,SV _64,NA,SV _64,SV _64,NA,NA,NA,NA,SV,NA
-            CullPrimitive,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NotPacked,NA
+            CullPrimitive,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NotInSig,NA,NA,NA,NA,NotPacked,NA
         """
         table = [list(map(str.strip, line.split(','))) for line in SemanticInterpretationCSV.splitlines() if line.strip()]
         for row in table[1:]: assert(len(row) == len(table[0])) # Ensure table is rectangular
@@ -2618,7 +2623,7 @@ class db_hlsl_attribute(object):
 
 class db_hlsl_intrinsic(object):
     "An HLSL intrinsic declaration"
-    def __init__(self, name, idx, opname, params, ns, ns_idx, doc, ro, rn, unsigned_op, overload_idx, hidden):
+    def __init__(self, name, idx, opname, params, ns, ns_idx, doc, ro, rn, wv, unsigned_op, overload_idx, hidden):
         self.name = name                                # Function name
         self.idx = idx                                  # Unique number within namespace
         self.opname = opname                            # D3D-style name
@@ -2630,6 +2635,7 @@ class db_hlsl_intrinsic(object):
         self.enum_name = "%s_%s" % (id_prefix, name)    # enum name
         self.readonly = ro                              # Only read memory
         self.readnone = rn                              # Not read memory
+        self.wave = wv                                  # Is wave-sensitive
         self.unsigned_op = unsigned_op                  # Unsigned opcode if exist
         if unsigned_op != "":
             self.unsigned_op = "%s_%s" % (id_prefix, unsigned_op)
@@ -2870,6 +2876,7 @@ class db_hlsl(object):
             attrs = attr.split(',')
             readonly = False          # Only read memory
             readnone = False          # Not read memory
+            is_wave = False;          # Is wave-sensitive
             unsigned_op = ""          # Unsigned opcode if exist
             overload_param_index = -1 # Parameter determines the overload type, -1 means ret type.
             hidden = False
@@ -2881,6 +2888,9 @@ class db_hlsl(object):
                     continue
                 if (a == "rn"):
                     readnone = True
+                    continue
+                if (a == "wv"):
+                    is_wave = True
                     continue
                 if (a == "hidden"):
                     hidden = True
@@ -2901,7 +2911,7 @@ class db_hlsl(object):
                     continue
                 assert False, "invalid attr %s" % (a)
 
-            return readonly, readnone, unsigned_op, overload_param_index, hidden
+            return readonly, readnone, is_wave, unsigned_op, overload_param_index, hidden
 
         current_namespace = None
         for line in intrinsic_defs:
@@ -2934,7 +2944,7 @@ class db_hlsl(object):
                         op = operand_match.group(1)
                 if not op:
                     op = name
-                readonly, readnone, unsigned_op, overload_param_index, hidden = process_attr(attr)
+                readonly, readnone, is_wave, unsigned_op, overload_param_index, hidden = process_attr(attr)
                 # Add an entry for this intrinsic.
                 if bracket_cleanup_re.search(opts):
                     opts = bracket_cleanup_re.sub(r"<\1@\2>", opts)
@@ -2958,7 +2968,7 @@ class db_hlsl(object):
                 # TODO: verify a single level of indirection
                 self.intrinsics.append(db_hlsl_intrinsic(
                     name, num_entries, op, args, current_namespace, ns_idx, "pending doc for " + name,
-                    readonly, readnone, unsigned_op, overload_param_index, hidden))
+                    readonly, readnone, is_wave, unsigned_op, overload_param_index, hidden))
                 num_entries += 1
                 continue
             assert False, "cannot parse line %s" % (line)
