@@ -164,8 +164,10 @@ Value *DxilValueCache::ProcessAndSimplify_Br(Instruction *I, DominatorTree *DT) 
     Value *Cond = TryGetCachedValue(Br->getCondition());
 
     if (IsUnreachable_(BB)) {
-      MarkUnreachable(FalseSucc);
-      MarkUnreachable(TrueSucc);
+      if (FalseSucc->getSinglePredecessor())
+        MarkUnreachable(FalseSucc);
+      if (TrueSucc->getSinglePredecessor())
+        MarkUnreachable(TrueSucc);
     }
     else if (IsConstantTrue(Cond)) {
       if (IsAlwaysReachable_(BB)) {
@@ -285,8 +287,6 @@ Value *DxilValueCache::SimplifyAndCacheResult(Instruction *I, DominatorTree *DT)
   return Simplified;
 }
 
-STATISTIC(StaleValuesEncountered, "Stale Values Encountered");
-
 bool DxilValueCache::WeakValueMap::Seen(Value *V) {
   auto FindIt = Map.find(V);
   if (FindIt == Map.end())
@@ -385,6 +385,8 @@ const char *DxilValueCache::getPassName() const {
 }
 
 Value *DxilValueCache::GetValue(Value *V, DominatorTree *DT) {
+  if (dyn_cast<Constant>(V))
+    return V;
   if (Value *NewV = ValueMap.Get(V))
     return NewV;
   return ProcessValue(V, DT);
@@ -393,6 +395,12 @@ Value *DxilValueCache::GetValue(Value *V, DominatorTree *DT) {
 Constant *DxilValueCache::GetConstValue(Value *V, DominatorTree *DT) {
   if (Value *NewV = GetValue(V))
     return dyn_cast<Constant>(NewV);
+  return nullptr;
+}
+
+ConstantInt *DxilValueCache::GetConstInt(Value *V, DominatorTree *DT) {
+  if (Value *NewV = GetValue(V))
+    return dyn_cast<ConstantInt>(NewV);
   return nullptr;
 }
 

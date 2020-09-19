@@ -497,17 +497,17 @@ class db_oload_gen:
             assert len(instr.oload_types)==1, "overload no elt_ty %s" % (instr.name)
             ty = instr.oload_types[0]
             type_code_texts = {
-            "d": "Type::getDoubleTy(m_Ctx)",
-            "f": "Type::getFloatTy(m_Ctx)",
+            "d": "Type::getDoubleTy(Ctx)",
+            "f": "Type::getFloatTy(Ctx)",
             "h": "Type::getHalfTy",
-            "1": "IntegerType::get(m_Ctx, 1)",
-			"8": "IntegerType::get(m_Ctx, 8)",
-            "w": "IntegerType::get(m_Ctx, 16)",
-            "i": "IntegerType::get(m_Ctx, 32)",
-            "l": "IntegerType::get(m_Ctx, 64)",
-            "v": "Type::getVoidTy(m_Ctx)",
-            "u": "Type::getInt32PtrTy(m_Ctx)",
-            "o": "Type::getInt32PtrTy(m_Ctx)",
+            "1": "IntegerType::get(Ctx, 1)",
+            "8": "IntegerType::get(Ctx, 8)",
+            "w": "IntegerType::get(Ctx, 16)",
+            "i": "IntegerType::get(Ctx, 32)",
+            "l": "IntegerType::get(Ctx, 64)",
+            "v": "Type::getVoidTy(Ctx)",
+            "u": "Type::getInt32PtrTy(Ctx)",
+            "o": "Type::getInt32PtrTy(Ctx)",
             }
             assert ty in type_code_texts, "llvm type %s is unknown" % (ty)
             ty_code = type_code_texts[ty]
@@ -810,6 +810,21 @@ def get_instrs_pred(varname, pred, attr_name="dxil_opid"):
     result += "return %s;" % build_range_code(varname, [getattr(i, attr_name) for i in llvm_instrs])
     result += "\n"
     return result
+
+def counter_pred(name, dxil_op=True):
+    def pred(i):
+        return (dxil_op == i.is_dxil_op) and getattr(i, 'props') and 'counters' in i.props and name in i.props['counters']
+    return pred
+
+def get_counters():
+    db = get_db_dxil()
+    return db.counters
+def get_llvm_op_counters():
+    db = get_db_dxil()
+    return [c for c in db.counters if c in db.llvm_op_counters]
+def get_dxil_op_counters():
+    db = get_db_dxil()
+    return [c for c in db.counters if c in db.dxil_op_counters]
 
 def get_instrs_rst():
     "Create an rst table of allowed LLVM instructions."
@@ -1423,6 +1438,9 @@ if __name__ == "__main__":
             'include/dxc/HlslIntrinsicOp.h',
             'tools/clang/tools/dxcompiler/dxcdisassembler.cpp',
             'include/dxc/DXIL/DxilSigPoint.inl',
+            'include/dxc/DXIL/DxilCounters.h',
+            'lib/DXIL/DxilCounters.cpp',
+            'lib/DXIL/DxilMetadataHelper.cpp',
             ]
         for relative_file_path in files:
             RunCodeTagUpdate(pj(hlsl_src_dir, relative_file_path))

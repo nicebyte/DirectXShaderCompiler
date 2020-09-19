@@ -21,6 +21,7 @@
 #include "llvm/Analysis/DxilValueCache.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/IR/CFG.h"
 
 #include "CodeGenModule.h"
 #include "clang/Frontend/CodeGenOptions.h"
@@ -42,6 +43,7 @@
 
 #include <vector>
 #include <memory>
+#include <fenv.h>
 
 #include "CGHLSLMSHelper.h"
 
@@ -1399,7 +1401,7 @@ void SimpleTransformForHLDXIRInst(Instruction *I, SmallInstSet &deadInsts) {
 
 namespace CGHLSLMSHelper {
 
-Value *TryEvalIntrinsic(CallInst *CI, IntrinsicOp intriOp) {
+Value *TryEvalIntrinsic(CallInst *CI, IntrinsicOp intriOp, unsigned hlslVersion) {
   switch (intriOp) {
   case IntrinsicOp::IOP_tan: {
     return EvalUnaryIntrinsic(CI, tanf, tan);
@@ -1526,7 +1528,22 @@ Value *TryEvalIntrinsic(CallInst *CI, IntrinsicOp intriOp) {
     return EvalUnaryIntrinsic(CI, floorf, floor);
   } break;
   case IntrinsicOp::IOP_round: {
-    return EvalUnaryIntrinsic(CI, roundf, round);
+    // round intrinsic could exhibit different behaviour for constant and runtime evaluations.
+    // E.g., for round(0.5): constant evaluation results in 1 (away from zero rounding), 
+    // while runtime evaluation results in 0 (nearest even rounding).
+    // 
+    // For back compat, DXC still preserves the above behavior for language versions 2016 or below.
+    // However, for newer language versions, DXC now always use nearest even for round() intrinsic in all
+    // cases.
+    if (hlslVersion <= 2016) {
+      return EvalUnaryIntrinsic(CI, roundf, round);
+    } else {
+      auto roundingMode = fegetround();
+      fesetround(FE_TONEAREST);
+      Value *result = EvalUnaryIntrinsic(CI, nearbyintf, nearbyint);
+      fesetround(roundingMode);
+      return result;
+    }
   } break;
   case IntrinsicOp::IOP_trunc: {
     return EvalUnaryIntrinsic(CI, truncf, trunc);
@@ -1597,19 +1614,62 @@ unsigned RoundToAlign(unsigned num, unsigned mod) {
   return num;
 }
 
+// Retrieve the last scalar or vector element type.
+// This has to be recursive for the nasty empty struct case.
+// returns true if found, false if we must backtrack.
+bool RetrieveLastElementType(Type *Ty, Type *&EltTy) {
+  if (Ty->isStructTy()) {
+    if (Ty->getStructNumElements() == 0)
+      return false;
+    for (unsigned i = Ty->getStructNumElements(); i > 0; --i) {
+      if (RetrieveLastElementType(Ty->getStructElementType(i - 1), EltTy))
+        return true;
+    }
+  } else if (Ty->isArrayTy()) {
+    if (RetrieveLastElementType(Ty->getArrayElementType(), EltTy))
+      return true;
+  } else if ((Ty->isVectorTy() || Ty->isSingleValueType())) {
+    EltTy = Ty->getScalarType();
+    return true;
+  }
+  return false;
+}
+
 // Here the size is CB size.
 // Offset still needs to be aligned based on type since this
 // is the legacy cbuffer global path.
 unsigned AlignCBufferOffset(unsigned offset, unsigned size, llvm::Type *Ty,
-                            bool bRowMajor) {
+                            bool bRowMajor,
+                            bool bMinPrecMode, bool &bCurRowIsMinPrec) {
   DXASSERT(!(offset & 1), "otherwise we have an invalid offset.");
   bool bNeedNewRow = Ty->isArrayTy();
-  if (!bNeedNewRow && Ty->isStructTy()) {
-    if (HLMatrixType mat = HLMatrixType::dyn_cast(Ty)) {
-      bNeedNewRow |= !bRowMajor && mat.getNumColumns() > 1;
-      bNeedNewRow |= bRowMajor && mat.getNumRows() > 1;
+  // In min-precision mode, a new row is needed when
+  // going into or out of min-precision component type.
+  if (!bNeedNewRow) {
+    bool bMinPrec = false;
+    if (Ty->isStructTy()) {
+      if (HLMatrixType mat = HLMatrixType::dyn_cast(Ty)) {
+        bNeedNewRow |= !bRowMajor && mat.getNumColumns() > 1;
+        bNeedNewRow |= bRowMajor && mat.getNumRows() > 1;
+        bMinPrec = bMinPrecMode && mat.getElementType(false)->getScalarSizeInBits() < 32;
+      } else {
+        bNeedNewRow = true;
+        if (bMinPrecMode) {
+          // Need to get min-prec of last element of structure,
+          // in case we pack something else into the end.
+          Type *EltTy = nullptr;
+          if (RetrieveLastElementType(Ty, EltTy))
+            bCurRowIsMinPrec = EltTy->getScalarSizeInBits() < 32;
+        }
+      }
     } else {
-      bNeedNewRow = true;
+      DXASSERT_NOMSG(Ty->isVectorTy() || Ty->isSingleValueType());
+      // vector or scalar
+      bMinPrec = bMinPrecMode && Ty->getScalarSizeInBits() < 32;
+    }
+    if (bMinPrecMode) {
+      bNeedNewRow |= bCurRowIsMinPrec != bMinPrec;
+      bCurRowIsMinPrec = bMinPrec;
     }
   }
   unsigned scalarSizeInBytes = Ty->getScalarSizeInBits() / 8;
@@ -1621,7 +1681,8 @@ unsigned AlignCBufferOffset(unsigned offset, unsigned size, llvm::Type *Ty,
 unsigned
 AllocateDxilConstantBuffer(HLCBuffer &CB,
                            std::unordered_map<Constant *, DxilFieldAnnotation>
-                               &constVarAnnotationMap) {
+                               &constVarAnnotationMap,
+                           bool bMinPrecMode) {
   unsigned offset = 0;
 
   // Scan user allocated constants first.
@@ -1636,6 +1697,7 @@ AllocateDxilConstantBuffer(HLCBuffer &CB,
   }
 
   // Alloc after user allocated constants.
+  bool bCurRowIsMinPrec = false;
   for (const std::unique_ptr<DxilResourceBase> &C : CB.GetConstants()) {
     if (C->GetLowerBound() != UINT_MAX)
       continue;
@@ -1648,7 +1710,7 @@ AllocateDxilConstantBuffer(HLCBuffer &CB,
                                MatrixOrientation::RowMajor
                          : false;
     // Align offset.
-    offset = AlignCBufferOffset(offset, size, Ty, bRowMajor);
+    offset = AlignCBufferOffset(offset, size, Ty, bRowMajor, bMinPrecMode, bCurRowIsMinPrec);
     if (C->GetLowerBound() == UINT_MAX) {
       C->SetLowerBound(offset);
     }
@@ -1663,7 +1725,8 @@ void AllocateDxilConstantBuffers(
                        &constVarAnnotationMap) {
   for (unsigned i = 0; i < HLM.GetCBuffers().size(); i++) {
     HLCBuffer &CB = *static_cast<HLCBuffer *>(&(HLM.GetCBuffer(i)));
-    unsigned size = AllocateDxilConstantBuffer(CB, constVarAnnotationMap);
+    unsigned size = AllocateDxilConstantBuffer(CB, constVarAnnotationMap,
+      HLM.GetHLOptions().bUseMinPrecision);
     CB.SetSize(size);
   }
 }
@@ -2127,7 +2190,7 @@ bool BuildImmInit(Function *Ctor) {
 namespace CGHLSLMSHelper {
 
 void ProcessCtorFunctions(llvm::Module &M, StringRef globalName,
-                          Instruction *InsertPt) {
+                          Instruction *InsertPt, bool bRemoveGlobal) {
   // add global call to entry func
   GlobalVariable *GV = M.getGlobalVariable(globalName);
   if (!GV)
@@ -2165,12 +2228,14 @@ void ProcessCtorFunctions(llvm::Module &M, StringRef globalName,
     }
   }
   // remove the GV
-  GV->eraseFromParent();
+  if (bRemoveGlobal) {
+    GV->eraseFromParent();
+  }
 }
 
-void FinishCBuffer(HLModule &HLM, llvm::Type *CBufferType,
-                   std::unordered_map<Constant *, DxilFieldAnnotation>
-                       &constVarAnnotationMap) {
+void FinishCBuffer(
+    HLModule &HLM, llvm::Type *CBufferType,
+    std::unordered_map<Constant *, DxilFieldAnnotation> &constVarAnnotationMap) {
   // Allocate constant buffers.
   AllocateDxilConstantBuffers(HLM, constVarAnnotationMap);
   // TODO: create temp variable for constant which has store use.
@@ -2607,8 +2672,371 @@ void AddDxBreak(Module &M, const SmallVector<llvm::BranchInst*, 16> &DxBreaks) {
     if (WaveUsers.count(BI->getParent()->getParent())) {
       CallInst *Call = CallInst::Create(FT, func, ArrayRef<Value *>(), "", BI);
       BI->setCondition(Call);
+      if (!BI->getMetadata(DXIL::kDxBreakMDName)) {
+        BI->setMetadata(DXIL::kDxBreakMDName, llvm::MDNode::get(BI->getContext(), {}));
+      }
     }
   }
 }
 
 }
+
+namespace CGHLSLMSHelper {
+
+ScopeInfo::ScopeInfo(Function *F) : maxRetLevel(0), bAllReturnsInIf(true) {
+  Scope FuncScope;
+  FuncScope.kind = Scope::ScopeKind::FunctionScope;
+  FuncScope.EndScopeBB = nullptr;
+  FuncScope.bWholeScopeReturned = false;
+  // Make it 0 to avoid check when get parent.
+  // All loop on scopes should check kind != FunctionScope.
+  FuncScope.parentScopeIndex = 0;
+  scopes.emplace_back(FuncScope);
+  scopeStack.emplace_back(0);
+}
+
+// When all returns is inside if which is not nested, the flow is still
+// structurized even there're more than one return.
+bool ScopeInfo::CanSkipStructurize() {
+  return bAllReturnsInIf && maxRetLevel < 2;
+}
+
+void ScopeInfo::AddScope(Scope::ScopeKind k, BasicBlock *endScopeBB) {
+  Scope Scope;
+  Scope.kind = k;
+  Scope.bWholeScopeReturned = false;
+  Scope.EndScopeBB = endScopeBB;
+  Scope.parentScopeIndex = scopeStack.back();
+  scopeStack.emplace_back(scopes.size());
+  scopes.emplace_back(Scope);
+}
+
+void ScopeInfo::AddIf(BasicBlock *endIfBB) {
+  AddScope(Scope::ScopeKind::IfScope, endIfBB);
+}
+
+void ScopeInfo::AddSwitch(BasicBlock *endSwitch) {
+  AddScope(Scope::ScopeKind::SwitchScope, endSwitch);
+}
+
+void ScopeInfo::AddLoop(BasicBlock *loopContinue, BasicBlock *endLoop) {
+  AddScope(Scope::ScopeKind::LoopScope, endLoop);
+  scopes.back().loopContinueBB = loopContinue;
+}
+
+void ScopeInfo::AddRet(BasicBlock *bbWithRet) {
+  Scope RetScope;
+  RetScope.kind = Scope::ScopeKind::ReturnScope;
+  RetScope.EndScopeBB = bbWithRet;
+  RetScope.parentScopeIndex = scopeStack.back();
+  // - 1 for function scope which is at scopeStack[0].
+  unsigned retLevel = scopeStack.size() - 1;
+  // save max nested level for ret.
+  maxRetLevel = std::max<unsigned>(maxRetLevel, retLevel);
+  bool bGotLoopOrSwitch = false;
+  for (auto it = scopeStack.rbegin(); it != scopeStack.rend(); it++) {
+    unsigned idx = *it;
+    Scope &S = scopes[idx];
+    switch (S.kind) {
+    default:
+      break;
+    case Scope::ScopeKind::LoopScope:
+    case Scope::ScopeKind::SwitchScope:
+      bGotLoopOrSwitch = true;
+      // For return inside loop and switch, can just break.
+      RetScope.parentScopeIndex = idx;
+      break;
+    }
+    if (bGotLoopOrSwitch)
+      break;
+  }
+  bAllReturnsInIf &= !bGotLoopOrSwitch;
+  // return finish current scope.
+  RetScope.bWholeScopeReturned = true;
+  // save retScope to rets.
+  rets.emplace_back(scopes.size());
+  scopes.emplace_back(RetScope);
+  // Don't need to put retScope to stack since it cannot nested other scopes.
+}
+
+void ScopeInfo::EndScope(bool bScopeFinishedWithRet) {
+  unsigned idx = scopeStack.pop_back_val();
+  Scope &Scope = GetScope(idx);
+  // If whole stmt is finished and end scope bb has not used(nothing branch to
+  // it). Then the whole scope is returned.
+  Scope.bWholeScopeReturned =
+      bScopeFinishedWithRet && Scope.EndScopeBB->user_empty();
+}
+
+Scope &ScopeInfo::GetScope(unsigned i) { return scopes[i]; }
+
+void ScopeInfo::LegalizeWholeReturnedScope() {
+  // legalize scopes which whole scope returned.
+  // When whole scope is returned, the endScopeBB will be deleted in codeGen.
+  // Here update it to parent scope's endScope.
+  // Since the scopes are in order, so it will automatic update to the final
+  // target. A->B->C will just get A->C.
+  for (auto &S : scopes) {
+    if (S.bWholeScopeReturned && S.kind != Scope::ScopeKind::ReturnScope) {
+      S.EndScopeBB = scopes[S.parentScopeIndex].EndScopeBB;
+    }
+  }
+}
+
+} // namespace CGHLSLMSHelper
+
+namespace {
+
+void updateEndScope(
+    ScopeInfo &ScopeInfo,
+    DenseMap<BasicBlock *, SmallVector<unsigned, 2>> &EndBBToScopeIndexMap,
+    BasicBlock *oldEndScope, BasicBlock *newEndScope) {
+  auto it = EndBBToScopeIndexMap.find(oldEndScope);
+  DXASSERT(it != EndBBToScopeIndexMap.end(),
+           "fail to find endScopeBB in EndBBToScopeIndexMap");
+  SmallVector<unsigned, 2> &scopeList = it->second;
+  // Don't need to update when not share endBB with other scope.
+  if (scopeList.size() < 2)
+    return;
+  for (unsigned i : scopeList) {
+    Scope &S = ScopeInfo.GetScope(i);
+    // Don't update return endBB, because that is the Block has return branch.
+    if (S.kind != Scope::ScopeKind::ReturnScope)
+      S.EndScopeBB = newEndScope;
+  }
+  EndBBToScopeIndexMap[newEndScope] = scopeList;
+}
+
+// Init ret value with undef to make sure it will not live thru loop inside
+// callers.
+// Because structurize return, the flow is controled by bIsReturned. The
+// semantic is the same as multiple return, but without konwledge of
+// bIsReturend, some path for structrized flow will have ret value not
+// initialized.
+// When function is called inside loop, ret value will live across the loop
+// after inline.
+void InitRetValue(BasicBlock *exitBB) {
+  Value *RetValPtr = nullptr;
+  if (ReturnInst *RI = dyn_cast<ReturnInst>(exitBB->getTerminator())) {
+    if (Value *RetV = RI->getReturnValue()) {
+      if (LoadInst *LI = dyn_cast<LoadInst>(RetV)) {
+        RetValPtr = LI->getPointerOperand();
+      }
+    }
+  }
+  if (!RetValPtr)
+    return;
+  if (AllocaInst *RetVAlloc = dyn_cast<AllocaInst>(RetValPtr)) {
+    IRBuilder<> B(RetVAlloc->getNextNode());
+    Type *Ty = RetVAlloc->getAllocatedType();
+    Value *Init = UndefValue::get(Ty);
+    if (Ty->isAggregateType()) {
+      // TODO: support aggreagate type and out parameters.
+      // Skip it here will cause undef on phi which the incoming path should never hit.
+    } else {
+      B.CreateStore(Init, RetVAlloc);
+    }
+  }
+}
+
+// For functions has multiple returns like
+// float foo(float a, float b, float c) {
+//   float r = c;
+//   if (a > 0) {
+//      if (b > 0) {
+//        return -1;
+//      }
+//      ***
+//   }
+//   ...
+//   return r;
+// }
+// transform into
+// float foo(float a, float b, float c) {
+//   bool bRet = false;
+//   float retV;
+//   float r = c;
+//   if (a > 0) {
+//      if (b > 0) {
+//        bRet = true;
+//        retV = -1;
+//      }
+//      if (!bRet) {
+//        ***
+//      }
+//   }
+//   if (!bRet) {
+//     ...
+//     retV = r;
+//   }
+//   return vRet;
+// }
+void StructurizeMultiRetFunction(Function *F, ScopeInfo &ScopeInfo,
+                                 bool bWaveEnabledStage,
+                                 SmallVector<BranchInst *, 16> &DxBreaks) {
+  if (ScopeInfo.CanSkipStructurize())
+    return;
+  // Get bbWithRets.
+  auto &rets = ScopeInfo.GetRetScopes();
+
+  IRBuilder<> B(F->getEntryBlock().begin());
+
+  Scope &FunctionScope = ScopeInfo.GetScope(0);
+
+  Type *boolTy = Type::getInt1Ty(F->getContext());
+  Constant *cTrue = ConstantInt::get(boolTy, 1);
+  Constant *cFalse = ConstantInt::get(boolTy, 0);
+  // bool bIsReturned = false;
+  AllocaInst *bIsReturned = B.CreateAlloca(boolTy, nullptr, "bReturned");
+  B.CreateStore(cFalse, bIsReturned);
+
+  Scope &RetScope = ScopeInfo.GetScope(rets[0]);
+  BasicBlock *exitBB = RetScope.EndScopeBB->getTerminator()->getSuccessor(0);
+  FunctionScope.EndScopeBB = exitBB;
+  // Find alloca for retunr val and init it to avoid undef after guard code with
+  // bIsReturned.
+  InitRetValue(exitBB);
+
+  ScopeInfo.LegalizeWholeReturnedScope();
+
+  // Map from endScopeBB to scope index.
+  // When 2 scopes share same endScopeBB, need to update endScopeBB after
+  // structurize.
+  DenseMap<BasicBlock *, SmallVector<unsigned, 2>> EndBBToScopeIndexMap;
+  auto &scopes = ScopeInfo.GetScopes();
+  for (unsigned i = 0; i < scopes.size(); i++) {
+    Scope &S = scopes[i];
+    EndBBToScopeIndexMap[S.EndScopeBB].emplace_back(i);
+  }
+
+  DenseSet<unsigned> guardedSet;
+
+  for (auto it = rets.begin(); it != rets.end(); it++) {
+    unsigned scopeIndex = *it;
+    Scope *pCurScope = &ScopeInfo.GetScope(scopeIndex);
+    Scope *pRetParentScope = &ScopeInfo.GetScope(pCurScope->parentScopeIndex);
+    // skip ret not in nested control flow.
+    if (pRetParentScope->kind == Scope::ScopeKind::FunctionScope)
+      continue;
+
+    do {
+      BasicBlock *BB = pCurScope->EndScopeBB;
+      // exit when scope is processed.
+      if (guardedSet.count(scopeIndex))
+        break;
+      guardedSet.insert(scopeIndex);
+
+      Scope *pParentScope = &ScopeInfo.GetScope(pCurScope->parentScopeIndex);
+      BasicBlock *EndBB = pParentScope->EndScopeBB;
+      // When whole scope returned, just branch to endScope of parent.
+      if (pCurScope->bWholeScopeReturned) {
+        // For ret, just branch to endScope of parent.
+        if (pCurScope->kind == Scope::ScopeKind::ReturnScope) {
+          BasicBlock *retBB = pCurScope->EndScopeBB;
+          TerminatorInst *retBr = retBB->getTerminator();
+          IRBuilder<> B(retBr);
+          // Set bReturned to true.
+          B.CreateStore(cTrue, bIsReturned);
+          if (bWaveEnabledStage &&
+              pParentScope->kind == Scope::ScopeKind::LoopScope) {
+            BranchInst *BI =
+                B.CreateCondBr(cTrue, EndBB, pParentScope->loopContinueBB);
+            DxBreaks.emplace_back(BI);
+            retBr->eraseFromParent();
+          } else {
+            // Update branch target.
+            retBr->setSuccessor(0, EndBB);
+          }
+        }
+        // For other scope, do nothing. Since whole scope is returned.
+        // Just flow naturally to parent scope.
+      } else {
+        // When only part scope returned.
+        // Use bIsReturned to guard to part which not returned.
+        switch (pParentScope->kind) {
+        case Scope::ScopeKind::ReturnScope:
+          DXASSERT(0, "return scope must get whole scope returned.");
+          break;
+        case Scope::ScopeKind::FunctionScope:
+        case Scope::ScopeKind::IfScope: {
+          // inside if.
+          // if (!bReturned) {
+          //   rest of if or else.
+          // }
+          BasicBlock *CmpBB = BasicBlock::Create(BB->getContext(),
+                                                 "bReturned.cmp.false", F, BB);
+
+          // Make BB preds go to cmpBB.
+          BB->replaceAllUsesWith(CmpBB);
+          // Update endscopeBB to CmpBB for scopes which has BB as endscope.
+          updateEndScope(ScopeInfo, EndBBToScopeIndexMap, BB, CmpBB);
+
+          IRBuilder<> B(CmpBB);
+          Value *isRetured = B.CreateLoad(bIsReturned, "bReturned.load");
+          Value *notReturned =
+              B.CreateICmpNE(isRetured, cFalse, "bReturned.not");
+          B.CreateCondBr(notReturned, EndBB, BB);
+        } break;
+        default: {
+          // inside switch/loop
+          // if (bReturned) {
+          //   br endOfScope.
+          // }
+          BasicBlock *CmpBB =
+              BasicBlock::Create(BB->getContext(), "bReturned.cmp.true", F, BB);
+          BasicBlock *BreakBB =
+              BasicBlock::Create(BB->getContext(), "bReturned.break", F, BB);
+          BB->replaceAllUsesWith(CmpBB);
+          // Update endscopeBB to CmpBB for scopes which has BB as endscope.
+          updateEndScope(ScopeInfo, EndBBToScopeIndexMap, BB, CmpBB);
+
+          IRBuilder<> B(CmpBB);
+          Value *isReturned = B.CreateLoad(bIsReturned, "bReturned.load");
+          isReturned = B.CreateICmpEQ(isReturned, cTrue, "bReturned.true");
+          B.CreateCondBr(isReturned, BreakBB, BB);
+
+          B.SetInsertPoint(BreakBB);
+          if (bWaveEnabledStage &&
+              pParentScope->kind == Scope::ScopeKind::LoopScope) {
+            BranchInst *BI =
+                B.CreateCondBr(cTrue, EndBB, pParentScope->loopContinueBB);
+            DxBreaks.emplace_back(BI);
+          } else {
+            B.CreateBr(EndBB);
+          }
+        } break;
+        }
+      }
+
+      scopeIndex = pCurScope->parentScopeIndex;
+      pCurScope = &ScopeInfo.GetScope(scopeIndex);
+      // done when reach function scope.
+    } while (pCurScope->kind != Scope::ScopeKind::FunctionScope);
+  }
+}
+} // namespace
+
+namespace CGHLSLMSHelper {
+void StructurizeMultiRet(Module &M, clang::CodeGen::CodeGenModule &CGM,
+                         DenseMap<Function *, ScopeInfo> &ScopeMap,
+                         bool bWaveEnabledStage,
+                         SmallVector<BranchInst *, 16> &DxBreaks) {
+  if (CGM.getCodeGenOpts().HLSLExtensionsCodegen) {
+    if (!CGM.getCodeGenOpts().HLSLExtensionsCodegen->IsOptionEnabled("structurize-returns"))
+      return;
+  } else {
+    if (!CGM.getCodeGenOpts().HLSLOptimizationToggles.count("structurize-returns") ||
+        !CGM.getCodeGenOpts().HLSLOptimizationToggles.find("structurize-returns")->second)
+      return;
+  }
+
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    auto it = ScopeMap.find(&F);
+    if (it == ScopeMap.end())
+      continue;
+    StructurizeMultiRetFunction(&F, it->second, bWaveEnabledStage, DxBreaks);
+  }
+}
+} // namespace CGHLSLMSHelper

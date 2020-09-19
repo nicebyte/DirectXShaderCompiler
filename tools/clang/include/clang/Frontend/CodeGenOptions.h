@@ -19,6 +19,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <map>
 #include "dxc/HLSL/HLSLExtensionsCodegenHelper.h" // HLSL change
 #include "dxc/Support/SPIRVOptions.h" // SPIR-V Change
 
@@ -179,6 +180,8 @@ public:
   bool HLSLHighLevel = false;
   /// Whether we allow preserve intermediate values
   bool HLSLAllowPreserveValues = false;
+  /// Whether we fail compilation if loop fails to unroll
+  bool HLSLOnlyWarnOnUnrollFail = false;
   /// Whether use row major as default matrix major.
   bool HLSLDefaultRowMajor = false;
   /// Whether use legacy cbuffer load.
@@ -220,6 +223,11 @@ public:
   bool HLSLResMayAlias = false;
   /// Lookback scan limit for memory dependencies
   unsigned ScanLimit = 0;
+  // Optimization pass enables, disables and selects
+  std::map<std::string, bool> HLSLOptimizationToggles;
+  std::map<std::string, std::string> HLSLOptimizationSelects;
+  /// Debug option to print IR after every pass
+  bool HLSLPrintAfterAll = false;
   // HLSL Change Ends
 
   // SPIRV Change Starts

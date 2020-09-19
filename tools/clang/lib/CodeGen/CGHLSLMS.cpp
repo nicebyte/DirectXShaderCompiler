@@ -211,6 +211,8 @@ private:
   std::unordered_map<Constant*, DxilFieldAnnotation> m_ConstVarAnnotationMap;
   StringSet<> m_PreciseOutputSet;
 
+  DenseMap<Function*, ScopeInfo> m_ScopeMap;
+  ScopeInfo *GetScopeInfo(Function *F);
 public:
   CGMSHLSLRuntime(CodeGenModule &CGM);
 
@@ -283,7 +285,13 @@ public:
   void MarkRetTemp(CodeGenFunction &CGF, llvm::Value *V,
                   clang::QualType QaulTy) override;
   void FinishAutoVar(CodeGenFunction &CGF, const VarDecl &D, llvm::Value *V) override;
-
+  void MarkIfStmt(CodeGenFunction &CGF, BasicBlock *endIfBB) override;
+  void MarkSwitchStmt(CodeGenFunction &CGF, SwitchInst *switchInst,
+                      BasicBlock *endSwitch) override;
+  void MarkReturnStmt(CodeGenFunction &CGF, BasicBlock *bbWithRet) override;
+  void MarkLoopStmt(CodeGenFunction &CGF, BasicBlock *loopContinue,
+                     BasicBlock *loopExit) override;
+  void MarkScopeEnd(CodeGenFunction &CGF) override;
   /// Get or add constant to the program
   HLCBuffer &GetOrCreateCBuffer(HLSLBufferDecl *D);
 };
@@ -682,7 +690,7 @@ MDNode *CGMSHLSLRuntime::GetOrAddResTypeMD(QualType resTy, bool bCreate) {
 
 namespace {
 MatrixOrientation GetMatrixMajor(QualType Ty, bool bDefaultRowMajor) {
-  DXASSERT(hlsl::IsHLSLMatType(Ty), "");
+  DXASSERT_NOMSG(hlsl::IsHLSLMatType(Ty));
   bool bIsRowMajor = bDefaultRowMajor;
   HasHLSLMatOrientation(Ty, &bIsRowMajor);
   return bIsRowMajor ? MatrixOrientation::RowMajor
@@ -2156,6 +2164,8 @@ void CGMSHLSLRuntime::AddHLSLFunctionInfo(Function *F, const FunctionDecl *FD) {
   for (const auto &Attr : FD->specific_attrs<HLSLExperimentalAttr>()) {
     F->addFnAttr(Twine("exp-", Attr->getName()).str(), Attr->getValue());
   }
+
+  m_ScopeMap[F] = ScopeInfo(F);
 }
 
 void CGMSHLSLRuntime::RemapObsoleteSemantic(DxilParameterAnnotation &paramInfo, bool isPatchConstantFunction) {
@@ -2707,7 +2717,7 @@ std::vector<StringRef> CGMSHLSLRuntime::ParseSubobjectExportsAssociations(String
     parsedExports.emplace_back(StringRef(pLast, pData - pLast));
   }
   
-  return std::move(parsedExports);
+  return parsedExports;
 }
 
 
@@ -3092,6 +3102,12 @@ void CGMSHLSLRuntime::AddConstant(VarDecl *constDecl, HLCBuffer &CB) {
     return;
   }
   llvm::Constant *constVal = CGM.GetAddrOfGlobalVar(constDecl);
+  // Add debug info for constVal.
+  if (CGDebugInfo *DI = CGM.getModuleDebugInfo())
+    if (CGM.getCodeGenOpts().getDebugInfo() >= CodeGenOptions::LimitedDebugInfo) {
+      DI->EmitGlobalVariable(cast<GlobalVariable>(constVal), constDecl);
+    }
+
   auto &regBindings = constantRegBindingMap[constVal];
   // Save resource properties for cbuffer variables.
   DxilResourceProperties RP = BuildResourceProperty(constDecl->getType());
@@ -3279,10 +3295,19 @@ HLCBuffer &CGMSHLSLRuntime::GetOrCreateCBuffer(HLSLBufferDecl *D) {
 void CGMSHLSLRuntime::FinishCodeGen() {
   HLModule &HLM = *m_pHLModule;
   llvm::Module &M = TheModule;
-
   // Do this before CloneShaderEntry and TranslateRayQueryConstructor to avoid
   // update valToResPropertiesMap for cloned inst.
   FinishIntrinsics(HLM, m_IntrinsicMap, valToResPropertiesMap);
+  bool bWaveEnabledStage = m_pHLModule->GetShaderModel()->IsPS() ||
+                           m_pHLModule->GetShaderModel()->IsCS() ||
+                           m_pHLModule->GetShaderModel()->IsLib();
+
+  // Handle lang extensions if provided.
+  if (CGM.getCodeGenOpts().HLSLExtensionsCodegen) {
+    ExtensionCodeGen(HLM, CGM);
+  }
+
+  StructurizeMultiRet(M, CGM, m_ScopeMap, bWaveEnabledStage, m_DxBreaks);
 
   FinishEntries(HLM, Entry, CGM, entryFunctionMap, HSEntryPatchConstantFuncAttr,
                 patchConstantFunctionMap, patchConstantFunctionPropsMap);
@@ -3308,8 +3333,34 @@ void CGMSHLSLRuntime::FinishCodeGen() {
   bool bIsLib = HLM.GetShaderModel()->IsLib();
   if (!bIsLib) {
     // need this for "llvm.global_dtors"?
+    if (HLM.GetShaderModel()->IsHS()) {
+      if (Function *patchConstantFn = HLM.GetPatchConstantFunction()) {
+        // static globals are independent for entry function and patch constant function.
+        // Update static global in entry function will not affect value in patch constant function.
+        // So just call ctors for patch constant function too.
+        ProcessCtorFunctions(
+            M, "llvm.global_ctors",
+            patchConstantFn->getEntryBlock().getFirstInsertionPt(), false);
+        IRBuilder<> B(patchConstantFn->getEntryBlock().getFirstInsertionPt());
+        // For static globals which has const initialize value, copy it at
+        // beginning of patch constant function to avoid use value updated by
+        // entry function.
+        for (GlobalVariable &GV : M.globals()) {
+          if (GV.isConstant())
+            continue;
+          if (!GV.hasInitializer())
+            continue;
+          if (GV.getName() == "llvm.global_ctors")
+            continue;
+          Value *V = GV.getInitializer();
+          if (isa<UndefValue>(V))
+            continue;
+          B.CreateStore(V, &GV);
+        }
+      }
+    }
     ProcessCtorFunctions(M, "llvm.global_ctors",
-                         Entry.Func->getEntryBlock().getFirstInsertionPt());
+                         Entry.Func->getEntryBlock().getFirstInsertionPt(), true);
   }
 
   UpdateLinkage(HLM, CGM, m_ExportMap, entryFunctionMap,
@@ -3321,10 +3372,6 @@ void CGMSHLSLRuntime::FinishCodeGen() {
   // Add dx.break function and make appropriate breaks conditional on it.
   AddDxBreak(M, m_DxBreaks);
 
-  // Handle lang extensions if provided.
-  if (CGM.getCodeGenOpts().HLSLExtensionsCodegen) {
-    ExtensionCodeGen(HLM, CGM);
-  }
   // At this point, we have a high-level DXIL module - record this.
   SetPauseResumePasses(*m_pHLModule->GetModule(), "hlsl-hlemit",
                        "hlsl-hlensure");
@@ -3361,7 +3408,7 @@ RValue CGMSHLSLRuntime::EmitHLSLBuiltinCallExpr(CodeGenFunction &CGF,
           StringRef intrinsicGroup;
           hlsl::GetIntrinsicOp(FD, intrinsicOpcode, intrinsicGroup);
           IntrinsicOp opcode = static_cast<IntrinsicOp>(intrinsicOpcode);
-          if (Value *Result = TryEvalIntrinsic(CI, opcode)) {
+          if (Value *Result = TryEvalIntrinsic(CI, opcode, CGM.getLangOpts().HLSLVersion)) {
             RV = RValue::get(Result);
           }
         }
@@ -5652,6 +5699,47 @@ void CGMSHLSLRuntime::EmitHLSLOutParamConversionCopyBack(
       }
     } else
       tmpArgAddr->replaceAllUsesWith(argLV.getAddress());
+  }
+}
+
+ScopeInfo *CGMSHLSLRuntime::GetScopeInfo(Function *F) {
+  auto it = m_ScopeMap.find(F);
+  if (it == m_ScopeMap.end())
+    return nullptr;
+  return &it->second;
+}
+
+void CGMSHLSLRuntime::MarkIfStmt(CodeGenFunction &CGF, BasicBlock *endIfBB) {
+  if (ScopeInfo *Scope = GetScopeInfo(CGF.CurFn))
+    Scope->AddIf(endIfBB);
+}
+
+
+void CGMSHLSLRuntime::MarkSwitchStmt(CodeGenFunction &CGF,
+                                     SwitchInst *switchInst,
+                                     BasicBlock *endSwitch) {
+  if (ScopeInfo *Scope = GetScopeInfo(CGF.CurFn))
+    Scope->AddSwitch(endSwitch);
+}
+
+void CGMSHLSLRuntime::MarkReturnStmt(CodeGenFunction &CGF,
+                                     BasicBlock *bbWithRet) {
+  if (ScopeInfo *Scope = GetScopeInfo(CGF.CurFn))
+    Scope->AddRet(bbWithRet);
+}
+
+void CGMSHLSLRuntime::MarkLoopStmt(CodeGenFunction &CGF,
+                                   BasicBlock *loopContinue,
+                                   BasicBlock *loopExit) {
+  if (ScopeInfo *Scope = GetScopeInfo(CGF.CurFn))
+    Scope->AddLoop(loopContinue, loopExit);
+}
+
+void CGMSHLSLRuntime::MarkScopeEnd(CodeGenFunction &CGF) {
+  if (ScopeInfo *Scope = GetScopeInfo(CGF.CurFn)) {
+    llvm::BasicBlock *CurBB = CGF.Builder.GetInsertBlock();
+    bool bScopeFinishedWithRet = !CurBB || CurBB->getTerminator();
+    Scope->EndScope(bScopeFinishedWithRet);
   }
 }
 

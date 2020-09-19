@@ -50,6 +50,7 @@ if "%1"=="" (goto :done_opt)
 
 if "%1"=="/?" goto :showhelp
 if "%1"=="-?" goto :showhelp
+if "%1"=="-h" goto :showhelp
 if "%1"=="-help" goto :showhelp
 if "%1"=="--help" goto :showhelp
 
@@ -137,6 +138,8 @@ if "%1"=="-clean" (
   set GENERATOR_NINJA=1
 ) else if "%1"=="-rel" (
   set BUILD_CONFIG=Release
+) else if "%1"=="-Release" (
+  set BUILD_CONFIG=Release
 ) else if "%1"=="-x86" (
   rem Allow BUILD_ARCH override.  This may be used by HCT_EXTRAS scripts.
   set BUILD_ARCH=Win32
@@ -155,7 +158,13 @@ if "%1"=="-clean" (
   shift /1
 ) else if "%1"=="-custom-bin-set" (
   set CUSTOM_BIN_SET=%~2
- shift /1
+  shift /1
+) else if "%1"=="-file-check-dump" (
+  set ADDITIONAL_OPTS=%ADDITIONAL_OPTS% /p:"FileCheckDumpDir=%~2\HLSL"
+  shift /1
+) else if "%1"=="-dxil-loc" (
+  set DXIL_DLL_LOC=%~2
+  shift /1
 ) else if "%1"=="--" (
   shift /1
   goto :done_opt
@@ -200,10 +209,12 @@ if "%GENERATOR_NINJA%"=="1" (
   set TEST_DIR=%HLSL_BLD_DIR%\%BUILD_CONFIG%\test
 )
 
+if "%DXILCONV_LOC%"=="" ( 
+  set DXILCONV_LOC=%BIN_DIR%
+)
 if "%TEST_DXILCONV%"=="1" (
-  if "%DXILCONV_LOC%"=="" ( set DXILCONV_LOC=%BIN_DIR%\dxilconv.dll )
-  if not exist "%DXILCONV_LOC%" (
-    echo Skipping dxilconv tests, dxilconv.dll not found.
+  if not exist "%DXILCONV_LOC%\dxilconv.dll" (
+    echo Skipping dxilconv tests, dxilconv.dll not found at %DXILCONV_LOC%.
     set TEST_DXILCONV=0
   )
 )
@@ -237,6 +248,12 @@ if "%CUSTOM_BIN_SET%"=="" (
   )
 )
 if errorlevel 1 exit /b 1
+
+if not "%DXIL_DLL_LOC%"=="" (
+  echo Copying DXIL.dll to %TEST_DIR%:
+  call %HCT_DIR%\hctcopy.cmd %DXIL_DLL_LOC% %TEST_DIR% dxil.dll
+  if errorlevel 1 exit /b 1
+)
 
 rem Begin SPIRV change
 if "%TEST_SPIRV%"=="1" (
@@ -312,7 +329,7 @@ if exist "%HCT_EXTRAS%\hcttest-extras.cmd" (
 )
 
 if "%TEST_DXILCONV%"=="1" (
-  call :runte dxilconv-tests.dll /p:"DxilConvDataDir=%HLSL_SRC_DIR%\projects\dxilconv\test" %TEST_DXILCONV_FILTER%
+  call :runte dxilconv-tests.dll /p:"HlslDataDir=%HLSL_SRC_DIR%\projects\dxilconv\test" %TEST_DXILCONV_FILTER%
   set RES_DXILCONV=!ERRORLEVEL!
 )
 
@@ -372,6 +389,8 @@ echo   -adapter "adapter name" - overrides Adapter for execution tests
 echo   -verbose - for TAEF: turns off /parallel and removes logging filter
 echo   -custom-bin-set "file [file]..." - custom set of binaries to copy into test directory
 echo   -dxilconv-loc "dxilconv.dll location" - fetch dxilconv.dll from custom location
+echo   -dxil-loc "dxil.dll location" - fetch dxil.dll from provided location
+echo   -file-check-dump "dump-path" - dump file-check inputs to files under dump-path
 echo.
 echo current BUILD_ARCH=%BUILD_ARCH%.  Override with:
 echo   -x86 targets an x86 build (aka. Win32)
@@ -403,7 +422,7 @@ echo.
 echo Delete test directory and do not copy binaries or run tests:
 echo   hcttest clean
 echo.
-call :showtesample clang-hlsl-tests.dll /p:"DxilConvDataDir=%HLSL_SRC_DIR%\tools\clang\test\HLSL"
+call :showtesample clang-hlsl-tests.dll /p:"HlslDataDir=%HLSL_SRC_DIR%\tools\clang\test\HLSL"
 
 goto :eof
 
@@ -414,8 +433,8 @@ rem %2 - first argument to te
 rem %3 - second argument to te
 rem %4 - third argument to te
 
-echo te /labMode /miniDumpOnCrash %LOG_FILTER% %PARALLEL_OPTION% %TEST_DIR%\%*
-call te /labMode /miniDumpOnCrash %LOG_FILTER% %PARALLEL_OPTION% %TEST_DIR%\%*
+echo te /labMode /miniDumpOnCrash /unicodeOutput:false /outputFolder:%TEST_DIR% %LOG_FILTER% %PARALLEL_OPTION% %TEST_DIR%\%*
+call te /labMode /miniDumpOnCrash /unicodeOutput:false /outputFolder:%TEST_DIR% %LOG_FILTER% %PARALLEL_OPTION% %TEST_DIR%\%*
 
 if errorlevel 1 (
   call :showtesample %*

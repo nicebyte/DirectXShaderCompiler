@@ -1678,7 +1678,7 @@ Type *UpdateFieldTypeForLegacyLayout(Type *Ty,
       rows = matrix.Rows;
       cols = matrix.Cols;
     } else {
-      DXASSERT(matrix.Orientation == MatrixOrientation::ColumnMajor, "");
+      DXASSERT_NOMSG(matrix.Orientation == MatrixOrientation::ColumnMajor);
       cols = matrix.Rows;
       rows = matrix.Cols;
     }
@@ -1819,7 +1819,7 @@ void UpdateStructTypeForLegacyLayoutOnDM(DxilModule &DM) {
   }
 
   for (auto &SRV : DM.GetSRVs()) {
-    if (SRV->GetKind() == DxilResourceBase::Kind::StructuredBuffer)
+    if (SRV->IsStructuredBuffer() || SRV->IsTBuffer())
       UpdateStructTypeForLegacyLayout(*SRV.get(), TypeSys, M);
   }
 }
@@ -1875,8 +1875,10 @@ void DxilLowerCreateHandleForLib::UpdateResourceSymbols() {
 namespace {
 
 void ReplaceResourceUserWithHandle(
-    LoadInst *Res, Value *handle) {
-  for (auto resUser = Res->user_begin(); resUser != Res->user_end();) {
+    DxilResource &res,
+    LoadInst *load, Value *handle)
+{
+  for (auto resUser = load->user_begin(); resUser != load->user_end();) {
     Value *V = *(resUser++);
     CallInst *CI = dyn_cast<CallInst>(V);
     DxilInst_CreateHandleForLib createHandle(CI);
@@ -1884,7 +1886,33 @@ void ReplaceResourceUserWithHandle(
     CI->replaceAllUsesWith(handle);
     CI->eraseFromParent();
   }
-  Res->eraseFromParent();
+
+  if (res.GetClass() == DXIL::ResourceClass::UAV) {
+    // Before this pass, the global resources might not have been mapped with all the uses.
+    // Now we're 100% sure who uses what resources (otherwise the compilation would have failed),
+    // so we do a round on marking UAV's as having counter.
+    static auto IsDxilOp = [](Value *V, hlsl::OP::OpCode Op) -> bool {
+      Instruction *I = dyn_cast<Instruction>(V);
+      if (!I)
+        return false;
+      return hlsl::OP::IsDxilOpFuncCallInst(I, Op);
+    };
+
+    // Search all users for update counter
+    for (User *U : handle->users()) {
+      if (IsDxilOp(U, hlsl::OP::OpCode::BufferUpdateCounter)) {
+        res.SetHasCounter(true);
+      }
+      else if (IsDxilOp(U, hlsl::OP::OpCode::AnnotateHandle)) {
+        for (User *UU : U->users()) {
+          if (IsDxilOp(UU, hlsl::OP::OpCode::BufferUpdateCounter))
+            res.SetHasCounter(true);
+        }
+      }
+    }
+  }
+
+  load->eraseFromParent();
 }
 
 } // namespace
@@ -1959,7 +1987,7 @@ void DxilLowerCreateHandleForLib::TranslateDxilResourceUses(
       Function *userF = ldInst->getParent()->getParent();
       DXASSERT(handleMapOnFunction.count(userF), "must exist");
       Value *handle = handleMapOnFunction[userF];
-      ReplaceResourceUserWithHandle(ldInst, handle);
+      ReplaceResourceUserWithHandle(static_cast<DxilResource &>(res), ldInst, handle);
     } else {
       DXASSERT(dyn_cast<GEPOperator>(user) != nullptr,
                "else AddOpcodeParamForIntrinsic in CodeGen did not patch uses "
@@ -2017,14 +2045,14 @@ void DxilLowerCreateHandleForLib::TranslateDxilResourceUses(
         // Must be load inst.
         LoadInst *ldInst = cast<LoadInst>(*(GEPU++));
         if (handle) {
-          ReplaceResourceUserWithHandle(ldInst, handle);
+          ReplaceResourceUserWithHandle(static_cast<DxilResource &>(res), ldInst, handle);
         } else {
           IRBuilder<> Builder = IRBuilder<>(ldInst);
           createHandleArgs[DXIL::OperandIndex::kCreateHandleResIndexOpIdx] =
               Builder.CreateAdd(idx, resLowerBound);
           Value *localHandle =
               Builder.CreateCall(createHandle, createHandleArgs, handleName);
-          ReplaceResourceUserWithHandle(ldInst, localHandle);
+          ReplaceResourceUserWithHandle(static_cast<DxilResource &>(res), ldInst, localHandle);
         }
       }
 
@@ -2098,6 +2126,10 @@ void PatchTBufferLoad(CallInst *handle, DxilModule &DM) {
     if (opcode == DXIL::OpCode::CBufferLoadLegacy) {
       DxilInst_CBufferLoadLegacy cbLoad(I);
 
+      StructType *cbRetTy = cast<StructType>(I->getType());
+      // elements will be 4, or 8 for native 16-bit types, which require special handling.
+      bool cbRet8Elt = cbRetTy->getNumElements() > 4;
+
       // Replace with appropriate buffer load instruction
       IRBuilder<> Builder(I);
       opcode = OP::OpCode::BufferLoad;
@@ -2140,8 +2172,29 @@ void PatchTBufferLoad(CallInst *handle, DxilModule &DM) {
               result = EEBuilder.CreateOr(high, low);
             }
           } else {
-            result = EEBuilder.CreateExtractValue(load, idx);
-            result = EEBuilder.CreateBitCast(result, EltTy);
+            if (cbRet8Elt) {
+              DXASSERT_NOMSG(cbRetTy->getNumElements() == 8);
+              DXASSERT_NOMSG(EltTy->getScalarSizeInBits() == 16);
+              // Translate extract from 16bit x 8 to extract and translate from i32 by 4
+              result = EEBuilder.CreateExtractValue(load, idx >> 1);
+              if (idx & 1)
+                result = EEBuilder.CreateLShr(result, 16);
+              result = EEBuilder.CreateTrunc(result, Type::getInt16Ty(Ctx));
+              if (EltTy->isHalfTy())
+                result = EEBuilder.CreateBitCast(result, EltTy);
+            } else {
+              result = EEBuilder.CreateExtractValue(load, idx);
+              if (Ty->getScalarSizeInBits() > EltTy->getScalarSizeInBits()) {
+                if (EltTy->isIntegerTy()) {
+                  result = EEBuilder.CreateTrunc(result, EltTy);
+                } else {
+                  result = EEBuilder.CreateBitCast(result, Type::getFloatTy(Ctx));
+                  result = EEBuilder.CreateFPTrunc(result, EltTy);
+                }
+              } else {
+                result = EEBuilder.CreateBitCast(result, EltTy);
+              }
+            }
           }
         } else {
           result = EEBuilder.CreateExtractValue(load, idx);
@@ -2258,7 +2311,36 @@ static void MarkCBUse(unsigned offset, FieldAnnotationByOffsetMap &fieldMap) {
     it->second->SetCBVarUsed(true);
 }
 
-static unsigned GetOffsetForCBExtractValue(ExtractValueInst *EV, bool bMinPrecision) {
+// Detect patterns of lshr v,16 or trunc to 16-bits and return low and high
+// word usage.
+static const unsigned kLowWordUsed = 1;
+static const unsigned kHighWordUsed = 2;
+static const unsigned kLowHighWordMask = kLowWordUsed | kHighWordUsed;
+static unsigned DetectLowAndHighWordUsage(ExtractValueInst *EV) {
+  unsigned result = 0;
+  if (EV->getType()->getScalarSizeInBits() == 32) {
+    for (auto U : EV->users()) {
+      Instruction *I = cast<Instruction>(U);
+      if (I->getOpcode() == LLVMLShr) {
+        ConstantInt *CShift = dyn_cast<ConstantInt>(I->getOperand(1));
+        if (CShift && CShift->getLimitedValue() == 16)
+          result |= kHighWordUsed;
+      } else if (I->getOpcode() == LLVMTrunc &&
+               I->getType()->getPrimitiveSizeInBits() == 16) {
+        result |= kLowWordUsed;
+      } else {
+        // Assume whole dword is used, return 0
+        return 0;
+      }
+      if ((result & kLowHighWordMask) == kLowHighWordMask)
+        break;
+    }
+  }
+  return result;
+}
+
+static unsigned GetOffsetForCBExtractValue(ExtractValueInst *EV, bool bMinPrecision,
+                                           unsigned &lowHighWordUsage) {
   DXASSERT(EV->getNumIndices() == 1, "otherwise, unexpected indices/type for extractvalue");
   unsigned typeSize = 4;
   unsigned bits = EV->getType()->getScalarSizeInBits();
@@ -2266,7 +2348,22 @@ static unsigned GetOffsetForCBExtractValue(ExtractValueInst *EV, bool bMinPrecis
     typeSize = 8;
   else if (bits == 16 && !bMinPrecision)
     typeSize = 2;
+  lowHighWordUsage = DetectLowAndHighWordUsage(EV);
   return (EV->getIndices().front() * typeSize);
+}
+
+// Marks up to two CB uses for the case where only 16-bit type(s)
+// are being used from lower or upper word of a tbuffer load,
+// which is always 4 x 32 instead of 8 x 16, like cbuffer.
+static void MarkCBUsesForExtractElement(
+    unsigned offset, FieldAnnotationByOffsetMap &fieldMap,
+    ExtractValueInst *EV, bool bMinPrecision) {
+  unsigned lowHighWordUsage = 0;
+  unsigned evOffset = GetOffsetForCBExtractValue(EV, bMinPrecision, lowHighWordUsage);
+  if (!lowHighWordUsage || 0 != (lowHighWordUsage & kLowWordUsed))
+    MarkCBUse(offset + evOffset, fieldMap);
+  if (lowHighWordUsage & kHighWordUsed)
+    MarkCBUse(offset + evOffset + 2, fieldMap);
 }
 
 static void CollectInPhiChain(PHINode *cbUser, unsigned offset,
@@ -2279,7 +2376,7 @@ static void CollectInPhiChain(PHINode *cbUser, unsigned offset,
   userSet.insert(cbUser);
   for (User *cbU : cbUser->users()) {
     if (ExtractValueInst *EV = dyn_cast<ExtractValueInst>(cbU)) {
-      MarkCBUse(offset + GetOffsetForCBExtractValue(EV, bMinPrecision), fieldMap);
+      MarkCBUsesForExtractElement(offset, fieldMap, EV, bMinPrecision);
     } else {
       PHINode *phi = cast<PHINode>(cbU);
       CollectInPhiChain(phi, offset, userSet, fieldMap, bMinPrecision);
@@ -2305,14 +2402,15 @@ static void CollectCBufferMemberUsage(Value *V,
         } else if (op == DXIL::OpCode::AnnotateHandle) {
           CollectCBufferMemberUsage(U, legacyFieldMap, newFieldMap, hlslOP,
                                     bMinPrecision, visited);
-        } else if (op == DXIL::OpCode::CBufferLoadLegacy) {
-          DxilInst_CBufferLoadLegacy cbload(CI);
-          Value *resIndex = cbload.get_regIndex();
-          unsigned offset = GetCBOffset(resIndex, visited);
-          offset <<= 4; // translate 16-byte vector index to byte offset
+        } else if (op == DXIL::OpCode::CBufferLoadLegacy ||
+                   op == DXIL::OpCode::BufferLoad) {
+          Value *resIndex = (op == DXIL::OpCode::CBufferLoadLegacy) ?
+            DxilInst_CBufferLoadLegacy(CI).get_regIndex() :
+            DxilInst_BufferLoad(CI).get_index();
+          unsigned offset = GetCBOffset(resIndex, visited) << 4;
           for (User *cbU : U->users()) {
             if (ExtractValueInst *EV = dyn_cast<ExtractValueInst>(cbU)) {
-              MarkCBUse(offset + GetOffsetForCBExtractValue(EV, bMinPrecision), legacyFieldMap);
+              MarkCBUsesForExtractElement(offset, legacyFieldMap, EV, bMinPrecision);
             } else {
               PHINode *phi = cast<PHINode>(cbU);
               std::unordered_set<Value *> userSet;
@@ -2336,11 +2434,29 @@ void DxilLowerCreateHandleForLib::UpdateCBufferUsage() {
   const DataLayout &DL = m_DM->GetModule()->getDataLayout();
   const auto &CBuffers = m_DM->GetCBuffers();
   OffsetForValueMap visited;
+
+  SmallVector<GlobalVariable*, 4> CBufferVars;
+
+  // Collect cbuffers
   for (auto it = CBuffers.begin(); it != CBuffers.end(); it++) {
     DxilCBuffer *CB = it->get();
     GlobalVariable *GV = dyn_cast<GlobalVariable>(CB->GetGlobalSymbol());
     if (GV == nullptr)
       continue;
+    CBufferVars.push_back(GV);
+  }
+
+  // Collect tbuffers
+  for (auto &it : m_DM->GetSRVs()) {
+    if (it->GetKind() != DXIL::ResourceKind::TBuffer)
+      continue;
+    GlobalVariable *GV = dyn_cast<GlobalVariable>(it->GetGlobalSymbol());
+    if (GV == nullptr)
+      continue;
+    CBufferVars.push_back(GV);
+  }
+
+  for (auto GV : CBufferVars) {
     Type *ElemTy = GV->getType()->getPointerElementType();
     ElemTy = dxilutil::StripArrayTypes(ElemTy, nullptr);
     StructType *ST = cast<StructType>(ElemTy);

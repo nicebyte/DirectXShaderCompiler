@@ -243,6 +243,9 @@ TEST_F(FileTest, UnaryOpLogicalNot) {
   runFileTest("unary-op.logical-not.hlsl");
 }
 
+// For sizeof()
+TEST_F(FileTest, UnaryOpSizeof) { runFileTest("unary-op.sizeof.hlsl"); }
+
 // For assignments
 TEST_F(FileTest, BinaryOpAssign) { runFileTest("binary-op.assign.hlsl"); }
 TEST_F(FileTest, BinaryOpAssignImage) {
@@ -544,6 +547,10 @@ TEST_F(FileTest, FunctionInOutParamVector) {
   setBeforeHLSLLegalization();
   runFileTest("fn.param.inout.vector.hlsl");
 }
+TEST_F(FileTest, FunctionInOutParamResource) {
+  setBeforeHLSLLegalization();
+  runFileTest("fn.param.inout.resource.hlsl");
+}
 TEST_F(FileTest, FunctionInOutParamDiffStorageClass) {
   setBeforeHLSLLegalization();
   runFileTest("fn.param.inout.storage-class.hlsl");
@@ -560,6 +567,12 @@ TEST_F(FileTest, FunctionInOutParamNoNeedToCopy) {
 TEST_F(FileTest, FunctionParamUnsizedArray) {
   // Unsized ararys as function params are not supported.
   runFileTest("fn.param.unsized-array.hlsl", Expect::Failure);
+}
+TEST_F(FileTest, FunctionParamUnsizedOpaqueArray) {
+  runFileTest("fn.param.unsized-opaque-array.hlsl", Expect::Success, false);
+}
+TEST_F(FileTest, FunctionParamUnsizedOpaqueArrayO3) {
+  runFileTest("fn.param.unsized-opaque-array-o3.hlsl");
 }
 TEST_F(FileTest, FunctionInOutParamTypeMismatch) {
   // The type for the inout parameter doesn't match the argument type.
@@ -797,6 +810,10 @@ TEST_F(FileTest, SemanticCoverageTypeMismatchPS) {
 TEST_F(FileTest, SemanticInnerCoveragePS) {
   runFileTest("semantic.inner-coverage.ps.hlsl");
 }
+TEST_F(FileTest, SemanticInnerCoverageTypeError) {
+  runFileTest("semantic.inner-coverage.type-error.hlsl", Expect::Failure);
+}
+
 TEST_F(FileTest, SemanticViewIDVS) { runFileTest("semantic.view-id.vs.hlsl"); }
 TEST_F(FileTest, SemanticViewIDHS) { runFileTest("semantic.view-id.hs.hlsl"); }
 TEST_F(FileTest, SemanticViewIDDS) { runFileTest("semantic.view-id.ds.hlsl"); }
@@ -901,6 +918,9 @@ TEST_F(FileTest, TextureSampleCmpLevelZero) {
 TEST_F(FileTest, TextureArraySampleCmpLevelZero) {
   runFileTest("texture.array.sample-cmp-level-zero.hlsl");
 }
+TEST_F(FileTest, TextureSampleInvalidImplicitLod) {
+  runFileTest("texture.sample-invalid-implicit-lod.hlsl", Expect::Failure);
+}
 
 // For structured buffer methods
 TEST_F(FileTest, StructuredBufferLoad) {
@@ -971,6 +991,13 @@ TEST_F(FileTest, BufferGetDimensions) {
 
 // For RWTexture methods
 TEST_F(FileTest, RWTextureLoad) { runFileTest("method.rwtexture.load.hlsl"); }
+
+TEST_F(FileTest, RWTextureLoadInvalidResidencyCode) {
+
+  runFileTest("method.rwtexture.load.invalid-residency-arg.hlsl",
+              Expect::Failure);
+}
+
 TEST_F(FileTest, RWTextureGetDimensions) {
   runFileTest("method.rwtexture.get-dimensions.hlsl");
 }
@@ -1171,6 +1198,9 @@ TEST_F(FileTest, IntrinsicsGetRenderTargetSamplePosition) {
 }
 TEST_F(FileTest, IntrinsicsNonUniformResourceIndex) {
   runFileTest("intrinsics.non-uniform-resource-index.hlsl");
+}
+TEST_F(FileTest, IntrinsicsMultiPrefix) {
+  runFileTest("intrinsics.multiprefix.hlsl", Expect::Failure);
 }
 
 // For attributes
@@ -1761,6 +1791,62 @@ TEST_F(FileTest, VulkanStructuredBufferCounter) {
   runFileTest("vk.binding.counter.hlsl");
 }
 
+TEST_F(FileTest, AutoShiftBindings) {
+  // Checks the correctness for the "-fvk-auto-shift-bindings" command line
+  // option.
+  runFileTest("vk.binding.cl.auto-shift-bindings.hlsl");
+}
+
+TEST_F(FileTest, BindingStructureOfResources1) {
+  // In Vulkan, OpTypeStruct must not contain an opaque type.
+  // Therefore this test fails validation before legalization is performed.
+  runFileTest("vk.binding.global-struct-of-resources.1.hlsl", Expect::Success,
+              /*runValidation*/ false);
+}
+
+TEST_F(FileTest, BindingStructureOfResources2) {
+  // In Vulkan, OpTypeStruct must not contain an opaque type.
+  // Therefore this test fails validation before legalization is performed.
+  runFileTest("vk.binding.global-struct-of-resources.2.hlsl", Expect::Success,
+              /*runValidation*/ false);
+}
+
+TEST_F(FileTest, BindingStructureOfResources3) {
+  // In Vulkan, OpTypeStruct must not contain an opaque type.
+  // Therefore this test fails validation before legalization is performed.
+  runFileTest("vk.binding.global-struct-of-resources.3.hlsl", Expect::Success,
+              /*runValidation*/ false);
+}
+
+TEST_F(FileTest, BindingStructureOfResources4) {
+  // In Vulkan, OpTypeStruct must not contain an opaque type.
+  // Therefore this test fails validation before legalization is performed.
+  runFileTest("vk.binding.global-struct-of-resources.4.hlsl", Expect::Success,
+              /*runValidation*/ false);
+}
+
+TEST_F(FileTest, BindingStructureOfResourcesOptimized) {
+  // After optimization is performed, this binary should pass validation.
+  runFileTest("vk.binding.global-struct-of-resources.optimized.hlsl",
+              Expect::Success, /*runValidation*/ true);
+}
+
+TEST_F(FileTest, BindingStructureOfResourcesAndNonResourcesError1) {
+  runFileTest("vk.binding.global-struct-of-resource-mix.error.1.hlsl",
+              Expect::Failure, /*runValidation*/ false);
+}
+
+TEST_F(FileTest, BindingStructureOfResourcesAndNonResourcesError2) {
+  runFileTest("vk.binding.global-struct-of-resource-mix.error.2.hlsl",
+              Expect::Failure);
+}
+
+TEST_F(FileTest, BindingStructureOfResourcesContainsBufferError) {
+  runFileTest(
+      "vk.binding.global-struct-of-resources.contains-buffer-error.hlsl",
+      Expect::Failure);
+}
+
 TEST_F(FileTest, VulkanPushConstant) { runFileTest("vk.push-constant.hlsl"); }
 TEST_F(FileTest, VulkanPushConstantOffset) {
   // Checks the behavior of [[vk::offset]] with [[vk::push_constant]]
@@ -2110,11 +2196,20 @@ TEST_F(FileTest, RayTracingNVCallable) {
 TEST_F(FileTest, RayTracingNVLibrary) {
   runFileTest("raytracing.nv.library.hlsl");
 }
+TEST_F(FileTest, RayTracingNVAccelerationStructure) {
+  useVulkan1p2();
+  runFileTest("raytracing.nv.acceleration-structure.hlsl");
+}
 
 // === Raytracing KHR examples ===
 TEST_F(FileTest, RayTracingKHRClosestHit) {
   useVulkan1p2();
   runFileTest("raytracing.khr.closesthit.hlsl");
+}
+
+TEST_F(FileTest, RayTracingAccelerationStructure) {
+  useVulkan1p2();
+  runFileTest("raytracing.acceleration-structure.hlsl");
 }
 
 // For decoration uniqueness
@@ -2179,7 +2274,9 @@ TEST_F(FileTest, VulkanShadingRateError) {
 
 // === MeshShading NV examples ===
 TEST_F(FileTest, MeshShadingNVMeshTriangle) {
-  runFileTest("meshshading.nv.triangle.mesh.hlsl");
+  // TODO: Re-enable spirv-val once issue#3006 is fixed.
+  runFileTest("meshshading.nv.triangle.mesh.hlsl", Expect::Success,
+              /* runValidation */ false);
 }
 TEST_F(FileTest, MeshShadingNVMeshLine) {
   runFileTest("meshshading.nv.line.mesh.hlsl");
@@ -2188,7 +2285,9 @@ TEST_F(FileTest, MeshShadingNVMeshPoint) {
   runFileTest("meshshading.nv.point.mesh.hlsl");
 }
 TEST_F(FileTest, MeshShadingNVMeshBuffer) {
-  runFileTest("meshshading.nv.buffer.mesh.hlsl");
+  // TODO: Re-enable spirv-val once issue#3006 is fixed.
+  runFileTest("meshshading.nv.buffer.mesh.hlsl", Expect::Success,
+              /* runValidation */ false);
 }
 TEST_F(FileTest, MeshShadingNVMeshError1) {
   runFileTest("meshshading.nv.error1.mesh.hlsl", Expect::Failure);
@@ -2233,11 +2332,15 @@ TEST_F(FileTest, MeshShadingNVMeshError14) {
   runFileTest("meshshading.nv.error14.mesh.hlsl", Expect::Failure);
 }
 TEST_F(FileTest, MeshShadingNVAmplification) {
-  runFileTest("meshshading.nv.amplification.hlsl");
+  // TODO: Re-enable spirv-val once issue#3006 is fixed.
+  runFileTest("meshshading.nv.amplification.hlsl", Expect::Success,
+              /* runValidation */ false);
 }
 TEST_F(FileTest, MeshShadingNVAmplificationFunCall) {
   useVulkan1p1();
-  runFileTest("meshshading.nv.fncall.amplification.hlsl");
+  // TODO: Re-enable spirv-val once issue#3006 is fixed.
+  runFileTest("meshshading.nv.fncall.amplification.hlsl", Expect::Success,
+              /* runValidation */ false);
 }
 TEST_F(FileTest, MeshShadingNVAmplificationError1) {
   runFileTest("meshshading.nv.error1.amplification.hlsl", Expect::Failure);
@@ -2263,13 +2366,20 @@ TEST_F(FileTest, Vk1p2BlockDecoration) {
   useVulkan1p2();
   runFileTest("vk.1p2.block-decoration.hlsl");
 }
+TEST_F(FileTest, Vk1p2RemoveBufferBlockRuntimeArray) {
+  useVulkan1p2();
+  runFileTest("vk.1p2.remove.bufferblock.runtimearray.hlsl");
+}
 
 // Test shaders that require Vulkan1.1 support with
 // -fspv-target-env=vulkan1.2 option to make sure that enabling
 // Vulkan1.2 also enables Vulkan1.1.
 TEST_F(FileTest, CompatibilityWithVk1p1) {
   useVulkan1p2();
-  runFileTest("meshshading.nv.fncall.amplification.vulkan1.2.hlsl");
+  // TODO: Re-enable spirv-val once issue#3006 is fixed.
+  runFileTest("meshshading.nv.fncall.amplification.vulkan1.2.hlsl",
+              Expect::Success,
+              /* runValidation */ false);
   runFileTest("sm6.quad-read-across-diagonal.vulkan1.2.hlsl");
   runFileTest("sm6.quad-read-across-x.vulkan1.2.hlsl");
   runFileTest("sm6.quad-read-across-y.vulkan1.2.hlsl");

@@ -1438,8 +1438,9 @@ namespace DXIL {
   extern const char* kFP32DenormValuePreserveString;
   extern const char* kFP32DenormValueFtzString;
 
-  static const char *kDxBreakFuncName = "dx.break";
-  static const char *kDxBreakCondName = "dx.break.cond";
+  extern const char *kDxBreakFuncName;
+  extern const char *kDxBreakCondName;
+  extern const char *kDxBreakMDName;
 
 } // namespace DXIL
 

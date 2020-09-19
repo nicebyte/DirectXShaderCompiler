@@ -15,15 +15,21 @@
 namespace clang {
 namespace spirv {
 
-SpirvFunction::SpirvFunction(QualType returnType,
-                             llvm::ArrayRef<QualType> paramTypes,
-                             SourceLocation loc, llvm::StringRef name,
-                             bool isPrecise)
-    : functionId(0), astReturnType(returnType),
-      astParamTypes(paramTypes.begin(), paramTypes.end()), returnType(nullptr),
+SpirvFunction::SpirvFunction(QualType returnType, SourceLocation loc,
+                             llvm::StringRef name, bool isPrecise)
+    : functionId(0), astReturnType(returnType), returnType(nullptr),
       fnType(nullptr), relaxedPrecision(false), precise(isPrecise),
       containsAlias(false), rvalue(false), functionLoc(loc),
       functionName(name) {}
+
+SpirvFunction::~SpirvFunction() {
+  for (auto *param : parameters)
+    param->releaseMemory();
+  for (auto *var : variables)
+    var->releaseMemory();
+  for (auto *bb : basicBlocks)
+    bb->~SpirvBasicBlock();
+}
 
 bool SpirvFunction::invokeVisitor(Visitor *visitor, bool reverseOrder) {
   if (!visitor->visit(this, Visitor::Phase::Init))
